@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from bson.son import SON
-from pymongo import Connection, ASCENDING, DESCENDING
+from pymongo import connection, Connection, ASCENDING, DESCENDING
+from pymongo.son import SON
 from pymongo.errors import ConnectionFailure, ConfigurationError, OperationFailure, AutoReconnect
 from bson import json_util
-
+import pagerank
 import re
+
 try:
     import json
 except ImportError:
@@ -130,6 +131,28 @@ class MongoHandler:
             result['cmd'] = args.getvalue('cmd')
 
         out(json.dumps(result, default=json_util.default))
+
+    def _pagerank(self, args, out, name = None, db = None, collection = None):
+        criteria = {}
+        if 'criteria' in args:
+            criteria = self._get_son(args['criteria'][0], out)
+            if criteria == None:
+                return
+
+	result = pagerank.GetPageRank(criteria['url'])
+	# Ensure variable is defined
+	try:
+	    result 
+	except NameError:
+	    result = None
+
+	# Test whether variable is defined to be None
+	if result is None or len(result) == 0:
+            out('{"ok" : 0, "url" : "'+criteria['url']+'","origUrl" : "'+criteria['origUrl']+'"}')
+	else:
+            out('{"ok" : 1, "url" : "'+criteria['url']+'","origUrl" : "'+criteria['origUrl']+'","rank": '+result.split(":")[2]+'}')
+
+        return
         
     def _hello(self, args, out, name = None, db = None, collection = None):
         out('{"ok" : 1, "msg" : "Uh, we had a slight weapons malfunction, but ' + 
@@ -157,6 +180,7 @@ class MongoHandler:
         if "server" in args:
             try:
                 uri = args.getvalue('server')
+                info = connection._parse_uri(uri)
             except Exception, e:
                 print uri
                 print e
@@ -203,6 +227,83 @@ class MongoHandler:
         else:
             out('{"ok" : 1}')
         
+
+    def _distinct(self, args, out, name = None, db = None, collection = None):
+        """
+        query the database.
+        """
+
+        if type(args).__name__ != 'dict':
+            out('{"ok" : 0, "errmsg" : "_find must be a GET request"}')
+            return
+
+        conn = self._get_connection(name)
+        if conn == None:
+            out('{"ok" : 0, "errmsg" : "couldn\'t get connection to mongo"}')
+            return
+
+        if db == None or collection == None:
+            out('{"ok" : 0, "errmsg" : "db and collection must be defined"}')
+            return            
+
+        criteria = {}
+        if 'criteria' in args:
+            criteria = self._get_son(args['criteria'][0], out)
+            if criteria == None:
+                return
+
+        fields = None
+        if 'fields' in args:
+            fields = self._get_son(args['fields'][0], out)
+            if fields == None:
+                return
+
+        limit = 0
+        if 'limit' in args:
+            limit = int(args['limit'][0])
+
+        skip = 0
+        if 'skip' in args:
+            skip = int(args['skip'][0])
+
+        cursor = conn[db][collection].distinct(criteria['key'])#.find(spec=criteria, fields=fields, limit=limit, skip=skip)
+
+        sort = None
+        if 'sort' in args:
+            sort = self._get_son(args['sort'][0], out)
+            if sort == None:
+                return
+
+            stupid_sort = []
+
+            for field in sort:
+                if sort[field] == -1:
+                    stupid_sort.append([field, DESCENDING])
+                else:
+                    stupid_sort.append([field, ASCENDING])
+
+            cursor.sort(stupid_sort)
+
+        if 'explain' in args and bool(args['explain'][0]):
+            out(json.dumps({"results" : [cursor.explain()], "ok" : 1}, default=json_util.default))
+
+
+        if not hasattr(self, "cursors"):
+            setattr(self, "cursors", {})
+
+        id = MongoHandler._cursor_id
+        MongoHandler._cursor_id = MongoHandler._cursor_id + 1
+
+        cursors = getattr(self, "cursors")
+        cursors[id] = cursor
+        #setattr(cursor, "id", id)
+
+        batch_size = 15
+        if 'batch_size' in args:
+            batch_size = int(args['batch_size'][0])
+            
+        self.__output_results(cursor, out, batch_size)
+
     def _find(self, args, out, name = None, db = None, collection = None):
         """
         query the database.
@@ -317,8 +418,16 @@ class MongoHandler:
         batch = []
 
         try:
-            while len(batch) < batch_size:
-                batch.append(cursor.next())
+            if type(cursor) is list:
+                key_values = cursor
+                out(json.dumps({"ok":1,"values":key_values}))
+		return
+
+            else:
+                while len(batch) < batch_size:
+                    batch.append(cursor.next())
+
+
         except AutoReconnect:
             out(json.dumps({"ok" : 0, "errmsg" : "auto reconnecting, please try again"}))
             return
@@ -328,9 +437,8 @@ class MongoHandler:
         except StopIteration:
             # this is so stupid, there's no has_next?
             pass
-        
-        out(json.dumps({"results" : batch, "id" : cursor.id, "ok" : 1}, default=json_util.default))
 
+	out(json.dumps({"results" : batch, "id" : cursor.id, "ok" : 1}, default=json_util.default))
 
     def _insert(self, args, out, name = None, db = None, collection = None):
         """
